@@ -32,8 +32,10 @@ class EvacuationState(Enum):
     CHECK_SPIN_BACK = 4
     CHECK_WAIT_CONFIRM = 5
     CHECK_SPIN_FRONT = 6
-    COMPLETED = 7
-    FAILED = 8
+    RECOVER_GO_TO_LAST = 7
+    RECOVER_SPIN = 8
+    COMPLETED = 9
+    FAILED = 10
 
 
 class EvacuationNode(Node):
@@ -49,12 +51,16 @@ class EvacuationNode(Node):
         self.declare_parameter("confirm_wait_sec", 2.0)
         self.declare_parameter("turn_back_rad", math.pi)
         self.declare_parameter("exit_goal", [])
+        self.declare_parameter("recover_retry_limit", 2)
+        self.declare_parameter("recover_spin_rad", math.tau)
 
         self.tb4_ns = str(self.get_parameter("tb4_ns").value).strip("/")
         self.visible_timeout_sec = float(self.get_parameter("visible_timeout_sec").value)
         self.check_interval_sec = float(self.get_parameter("check_interval_sec").value)
         self.confirm_wait_sec = float(self.get_parameter("confirm_wait_sec").value)
         self.turn_back_rad = float(self.get_parameter("turn_back_rad").value)
+        self.recover_retry_limit = int(self.get_parameter("recover_retry_limit").value)
+        self.recover_spin_rad = float(self.get_parameter("recover_spin_rad").value)
 
         # =========================
         # 2) State
@@ -66,6 +72,9 @@ class EvacuationNode(Node):
         self.last_check_time = 0.0
         self.confirm_deadline = 0.0
         self.check_reference_time = 0.0
+        self.last_person_pose = None
+        self.recover_retries = 0
+        self.recover_spin_started = False
 
         # =========================
         # 3) Subscriptions
@@ -112,6 +121,8 @@ class EvacuationNode(Node):
         if msg.data:
             self.last_true_time = time.time()
             self.has_person = True
+            self.last_person_pose = self.safe_get_current_pose()
+            self.recover_retries = 0
 
     # ======================================================
     # Helper: stand visible? (recent True)
@@ -172,6 +183,12 @@ class EvacuationNode(Node):
     def start_spin(self, rad: float, allowance: float = 8.0):
         self.nav.spin(spin_dist=float(rad), time_allowance=float(allowance))
 
+    def safe_get_current_pose(self):
+        if hasattr(self.nav, "getCurrentPose"):
+            return self.nav.getCurrentPose()
+        self.get_logger().warn("[RECOVER] Navigator has no getCurrentPose(); skip pose capture")
+        return None
+
     # ======================================================
     # Helper: start follower check
     # ======================================================
@@ -207,6 +224,13 @@ class EvacuationNode(Node):
                     self.get_logger().warn("[EXIT] arrived!")
                     self.state = EvacuationState.COMPLETED
                     self.active = False
+                elif self.recover_retries < self.recover_retry_limit:
+                    self.recover_retries += 1
+                    self.get_logger().warn(
+                        "[EXIT] navigation failed -> retrying "
+                        f"({self.recover_retries}/{self.recover_retry_limit})"
+                    )
+                    self.state = EvacuationState.WAIT_EXIT
                 else:
                     self.get_logger().warn(f"[EXIT] finished but not success (result={result})")
                     self.state = EvacuationState.FAILED
@@ -233,9 +257,9 @@ class EvacuationNode(Node):
                 return
 
             if time.time() >= self.confirm_deadline:
-                self.get_logger().warn("[CHECK] stand not detected -> resume anyway")
+                self.get_logger().warn("[CHECK] stand not detected -> recover")
                 self.start_spin(-self.turn_back_rad)
-                self.state = EvacuationState.CHECK_SPIN_FRONT
+                self.state = EvacuationState.RECOVER_GO_TO_LAST
             return
 
         if self.state == EvacuationState.CHECK_SPIN_FRONT:
@@ -245,6 +269,36 @@ class EvacuationNode(Node):
                 else:
                     self.state = EvacuationState.WAIT_EXIT
             return
+
+        if self.state == EvacuationState.RECOVER_GO_TO_LAST:
+            if not self.nav.isTaskComplete():
+                return
+            if self.last_person_pose is None:
+                self.get_logger().warn("[RECOVER] no last person pose -> resume exit")
+                self.state = EvacuationState.WAIT_EXIT
+                return
+            self.nav.startToPose(self.last_person_pose)
+            self.get_logger().warn("[RECOVER] moving to last person pose")
+            self.recover_spin_started = False
+            self.state = EvacuationState.RECOVER_SPIN
+            return
+
+        if self.state == EvacuationState.RECOVER_SPIN:
+            if not self.nav.isTaskComplete():
+                return
+            if not self.recover_spin_started:
+                if self.stand_visible():
+                    self.get_logger().info("[RECOVER] stand detected -> resume exit")
+                    self.state = EvacuationState.WAIT_EXIT
+                    return
+                self.start_spin(self.recover_spin_rad)
+                self.recover_spin_started = True
+                return
+            if self.stand_visible():
+                self.get_logger().info("[RECOVER] stand detected after spin -> resume exit")
+            else:
+                self.get_logger().warn("[RECOVER] stand not found -> resume exit")
+            self.state = EvacuationState.WAIT_EXIT
 
 
 def main(args=None):
